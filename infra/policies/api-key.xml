@@ -1,7 +1,8 @@
 <!--
   API-level policy: backend authenticates with an API key (Compass Core42).
   The client's own credentials are never forwarded; the key comes from the compass-api-key named value.
-  Placeholder __TIMEOUT__ is replaced by infra/api.bicep.
+  The inbound extras (token limit, token metric, circuit breaker backend) and the forward block (with
+  retry) are inserted by infra/api.bicep where the double-underscore markers are.
 -->
 <policies>
   <inbound>
@@ -9,10 +10,11 @@
     <set-header name="api-key" exists-action="override">
       <value>{{compass-api-key}}</value>
     </set-header>
+    __INBOUND_EXTRAS__
   </inbound>
   <backend>
     <!-- buffer-response=false lets SSE chunks (stream=true) flow through unbuffered -->
-    <forward-request timeout="__TIMEOUT__" buffer-response="false" fail-on-error-status-code="false" />
+    __FORWARD__
   </backend>
   <outbound />
   <on-error />

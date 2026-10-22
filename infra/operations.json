@@ -1,9 +1,9 @@
 [
-  { "name": "chat-completions", "method": "POST", "urlTemplate": "/v1/chat/completions", "templateParameters": [] },
-  { "name": "embeddings", "method": "POST", "urlTemplate": "/v1/embeddings", "templateParameters": [] },
-  { "name": "responses-create", "method": "POST", "urlTemplate": "/v1/responses", "templateParameters": [] },
-  { "name": "responses-get", "method": "GET", "urlTemplate": "/v1/responses/{response_id}", "templateParameters": ["response_id"] },
-  { "name": "responses-delete", "method": "DELETE", "urlTemplate": "/v1/responses/{response_id}", "templateParameters": ["response_id"] },
-  { "name": "responses-cancel", "method": "POST", "urlTemplate": "/v1/responses/{response_id}/cancel", "templateParameters": ["response_id"] },
-  { "name": "responses-input-items", "method": "GET", "urlTemplate": "/v1/responses/{response_id}/input_items", "templateParameters": ["response_id"] }
+  {"name": "chat-completions", "method": "POST", "urlTemplate": "/v1/chat/completions", "templateParameters": [], "modelInBody": true},
+  {"name": "embeddings", "method": "POST", "urlTemplate": "/v1/embeddings", "templateParameters": [], "modelInBody": true},
+  {"name": "responses-create", "method": "POST", "urlTemplate": "/v1/responses", "templateParameters": [], "modelInBody": true},
+  {"name": "responses-get", "method": "GET", "urlTemplate": "/v1/responses/{response_id}", "templateParameters": ["response_id"], "modelInBody": false},
+  {"name": "responses-delete", "method": "DELETE", "urlTemplate": "/v1/responses/{response_id}", "templateParameters": ["response_id"], "modelInBody": false},
+  {"name": "responses-cancel", "method": "POST", "urlTemplate": "/v1/responses/{response_id}/cancel", "templateParameters": ["response_id"], "modelInBody": false},
+  {"name": "responses-input-items", "method": "GET", "urlTemplate": "/v1/responses/{response_id}/input_items", "templateParameters": ["response_id"], "modelInBody": false}
 ]

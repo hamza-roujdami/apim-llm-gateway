@@ -2,7 +2,7 @@
 
 Bicep that provisions Azure API Management as an AI gateway for models from **Compass (Core42)** and **Microsoft Foundry**. Apps call one gateway with an OpenAI-compatible client; APIM adds the backend credentials and forwards the request without buffering, so streaming works. It includes an example Microsoft Agent Framework agent to try the whole cycle.
 
-Status: deployed and tested end to end on the `/foundry` API (`gpt-6-sol`, `text-embedding-3-large`): chat, Responses, embeddings, streaming, background, cancel, and the example agent with tools. The `/compass` API routes to Compass but has not been tested with a real Compass key yet.
+Status: deployed and tested end to end on the `/foundry` API (`gpt-6-sol`, `text-embedding-3-large`): chat, Responses, embeddings, streaming, background, cancel, and the example agent with tools. Per-app subscriptions, token limits and metrics, retry, the circuit breaker and the model allow-list are also tested live on `/foundry`. The `/compass` API routes to Compass but has not been tested with a real Compass key yet, and the Key Vault option for the Compass key validates but has not been run against a vault (see [Known limits](#known-limits)).
 
 ## Architecture
 
@@ -32,15 +32,30 @@ flowchart LR
 
 | Resource | File | Notes |
 |---|---|---|
-| APIM (Standard v2, public) | `apim.bicep` | System identity, `compass-api-key` secret, logging |
-| `/compass` and `/foundry` APIs | `api.bicep` | 7 operations, a policy and one subscription each |
+| APIM (Standard v2, public) | `apim.bicep` | System identity, logging, Application Insights custom metrics |
+| `compass-api-key` secret (named value) | `compass-key.bicep` | From a parameter, a placeholder, or an existing Key Vault |
+| `/compass` and `/foundry` APIs | `api.bicep` | 7 operations, a policy and a default subscription each, plus the optional protections below |
 | Foundry account, project, chat model (`gpt-6-sol`), embeddings model (`text-embedding-3-large`) | `foundry.bicep` | Optional; or use an existing account |
 | Log Analytics, Application Insights | `monitoring.bicep` | Optional |
-| Role for APIM on Foundry | `main.bicep` | *Cognitive Services OpenAI User* |
+| Role for APIM on Foundry (and on the Key Vault, if used) | `main.bicep` | *Cognitive Services OpenAI User* / *Key Vault Secrets User* |
 
 Both APIs expose the same OpenAI v1-style operations: `POST /v1/chat/completions`, `POST /v1/embeddings`, and the Responses API (`POST /v1/responses`, `GET`/`DELETE /v1/responses/{id}`, `POST .../cancel`, `GET .../input_items`).
 
-Not included: private networking, Key Vault-backed keys, caching, token limits, content filtering, Azure-style `/openai/deployments/...` paths, and the Compass Sweden Responses paths (`/v1/sweden/responses`, used only by the newest GPT-5.x models). Add what you need for production.
+### Gateway protections (all optional parameters)
+
+They apply to both APIs, so the same controls guard Compass and Foundry.
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `apps` | `[]` | One APIM subscription per app and API, named `<api>-<app>` (for example `foundry-team-a`). Each app gets its own key, token counter and metrics. Delete a subscription to revoke that app. |
+| `tokensPerMinute` | `0` (off) | Token limit per app (`llm-token-limit`). Over the limit the caller gets `429` with `Retry-After`. |
+| `emitTokenMetrics` | `true` | Token usage per API, app and token type, as the custom metric `azure.ai_gateway.client.token.usage` in Application Insights (`llm-emit-token-metric`; needs `deployMonitoring`). |
+| `retryCount` | `2` | Retries a backend `429` (and `503` when the circuit breaker is off) with waits of 1 s then 3 s. A stream that already started is not retried. `0` turns it off. |
+| `enableCircuitBreaker` | `false` | Backend circuit breaker: after 5 backend `429`/`5xx` responses in a minute, callers get `503` with `Retry-After` for a minute, without calling the backend. |
+| `compassAllowedModels`, `foundryAllowedModels` | `[]` (any) | Only these `model` values are accepted on chat, embeddings and Responses requests. Anything else, or a missing model, gets a `400` with code `model_not_allowed`. |
+| `compassKeyVaultName`, `compassKeySecretName` | empty, `compass-api-key` | Read the Compass key from an existing Key Vault instead of a parameter. APIM's identity gets *Key Vault Secrets User* on it. |
+
+Not included: private networking, caching, content filtering, Azure-style `/openai/deployments/...` paths, and the Compass Sweden Responses paths (`/v1/sweden/responses`, used only by the newest GPT-5.x models). Add what you need for production.
 
 ## Quick start
 
@@ -93,7 +108,7 @@ FOUNDRY_KEY=$(az rest --method post --query primaryKey -o tsv \
   --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.ApiManagement/service/$APIM/subscriptions/foundry-default/listSecrets?api-version=2024-05-01")
 ```
 
-Use `compass-default` instead of `foundry-default` for the Compass key.
+Use `compass-default` instead of `foundry-default` for the Compass key. If you set `apps`, each app has its own subscription (for example `foundry-team-a`); fetch its key the same way and give it to that app only.
 
 ### 5. Smoke test the gateway
 
@@ -121,15 +136,19 @@ uv run gateway-agent                                   # interactive chat with m
 
 ### 7. Use Compass
 
-Compass needs your Compass API key. Set it without redeploying:
+Compass needs your Compass API key. Two ways to provide it:
+
+**Key Vault (recommended).** Create a Key Vault that uses Azure RBAC, store the key as the secret `compass-api-key`, and deploy with `compassKeyVaultName=<vault>` (and `compassKeySecretName` if you named it differently). APIM reads the secret with its managed identity, so the key never appears in parameters or deployment history. APIM must be able to reach the vault: public network access with "Allow trusted Microsoft services", or a private endpoint plus APIM VNet integration. If the first deployment fails reading the secret because the new role isn't active yet, run it again.
+
+**Directly.** Set the key without redeploying:
 
 ```bash
 az apim nv update -g $RG -n $APIM --named-value-id compass-api-key --value "<compass key>" --secret true
 ```
 
-If you redeploy later, pass `compassApiKey` again (a secure parameter, or `--parameters compassApiKey=...`). An empty value resets the named value to the placeholder `set-me-later`, and Compass answers 401.
+If you redeploy later without Key Vault, pass `compassApiKey` again (a secure parameter, or `--parameters compassApiKey=...`). An empty value resets the named value to the placeholder `set-me-later`, and Compass answers 401.
 
-Then repeat steps 4 to 6 with the `compass-default` key and `/compass` instead of `/foundry`. Set `MODEL` to a Compass model served from the UAE region (for example `gpt-6-sol`, which Compass confirmed works on `/v1/responses`) and `EMBEDDING_MODEL=text-embedding-3-large`.
+Then repeat steps 4 to 6 with the `compass-default` key and `/compass` instead of `/foundry`. Set `MODEL` to a Compass model served from the UAE region (for example `gpt-6-sol`, which Compass confirmed works on `/v1/responses`) and `EMBEDDING_MODEL=text-embedding-3-large`. Use `compassAllowedModels` to restrict callers to those models.
 
 ### 8. Clean up
 
@@ -150,7 +169,17 @@ ApiManagementGatewayLogs
 | order by calls desc
 ```
 
-In Application Insights use **Live Metrics**, **Failures** and **Performance**. Token usage is not recorded.
+In Application Insights use **Live Metrics**, **Failures** and **Performance**. Token usage per app is in the custom metric `azure.ai_gateway.client.token.usage`; in the Application Insights **Logs**:
+
+```kusto
+customMetrics
+| where timestamp > ago(1d) and name == "azure.ai_gateway.client.token.usage"
+| extend app = tostring(customDimensions["Subscription ID"]), type = tostring(customDimensions["gen_ai.token.type"])
+| where type in ("input_tokens", "output_tokens")
+| summarize tokens = sum(valueSum) by app, type
+```
+
+Rejected and throttled calls show in the gateway log: token-limit blocks as `OpenAITokenLimitExceeded` (429), an open circuit breaker as 503.
 
 ## Use from your own client
 
@@ -185,12 +214,13 @@ client = OpenAIChatClient(
 ```
 infra/
   main.bicep               entry point
-  apim.bicep               APIM, Compass key, logging
-  api.bicep                one API (used for each backend)
+  apim.bicep               APIM instance and logging
+  compass-key.bicep        the compass-api-key secret (parameter, placeholder or Key Vault)
+  api.bicep                one API (used for each backend): operations, policies, subscriptions
   foundry.bicep            Foundry account + models (optional)
   monitoring.bicep         Log Analytics + App Insights (optional)
   operations.json          the operations exposed on every API
-  policies/                api-key.xml, managed-identity.xml
+  policies/                api-key.xml, managed-identity.xml, model-allowlist.xml
   params/                  main.example.bicepparam; *.local.bicepparam is git-ignored
 scripts/smoke-test.sh      checks every operation through the gateway
 app/                       example Microsoft Agent Framework agent (Python)
@@ -202,4 +232,9 @@ app/                       example Microsoft Agent Framework agent (Python)
 - Which region serves `gpt-6-sol` on Compass is unconfirmed (data residency).
 - A private Compass endpoint needs APIM to resolve its hostname to the private IP; confirm the hostname with Compass.
 - APIM Standard v2 has no static outbound IP, which matters if Compass restricts callers by IP.
+- Token limits and metrics read the `usage` section of responses; for streamed requests the counts are estimated, and v2 tiers use an approximate token bucket, so a burst can briefly exceed the limit.
+- Retries use fixed waits (1 s, then 3 s) and do not follow a backend `Retry-After`; the circuit breaker does. With the breaker on, only `429` is retried so an open breaker answers immediately.
+- The model allow-list compares the `model` field to the names you list; it does not check that the backend serves them.
+- Compass's rate-limit behaviour is unknown, so `tokensPerMinute`, `retryCount` and the breaker thresholds (5 errors per minute, one-minute trip) are starting points, tested only against Foundry.
+- The Key Vault option validates (lint and ARM) but was not run against a vault: in the tenant used to build this repo, new Key Vaults are created with public network access forced off, so APIM could not be tested reading from one.
 - The example agent is tested with `agent-framework-openai` 1.17.0 and `agent-framework-core` 1.22.0 (the versions a fresh `uv sync` resolves). `app/uv.lock` is not committed.

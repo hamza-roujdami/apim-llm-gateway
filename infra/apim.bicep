@@ -10,11 +10,6 @@ param skuCapacity int
 param logAnalyticsWorkspaceId string
 param appInsightsId string
 
-@secure()
-@description('Compass API key. Empty uses a placeholder (Compass answers 401 until it is set).')
-param compassApiKey string
-param createCompassKey bool
-
 resource apim 'Microsoft.ApiManagement/service@2024-05-01' = {
   name: name
   location: location
@@ -29,16 +24,6 @@ resource apim 'Microsoft.ApiManagement/service@2024-05-01' = {
   properties: {
     publisherEmail: publisherEmail
     publisherName: publisherName
-  }
-}
-
-resource compassKey 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = if (createCompassKey) {
-  parent: apim
-  name: 'compass-api-key'
-  properties: {
-    displayName: 'compass-api-key'
-    secret: true
-    value: empty(compassApiKey) ? 'set-me-later' : compassApiKey
   }
 }
 
@@ -81,6 +66,8 @@ resource diagnostic 'Microsoft.ApiManagement/service/diagnostics@2024-05-01' = i
   name: 'applicationinsights'
   properties: {
     loggerId: logger.id
+    // Required by llm-emit-token-metric to send custom metrics to Application Insights.
+    metrics: true
     alwaysLog: 'allErrors'
     verbosity: 'information'
     logClientIp: false

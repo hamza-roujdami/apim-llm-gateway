@@ -1,7 +1,8 @@
 <!--
   API-level policy: APIM's managed identity authenticates to the backend (Foundry / Azure OpenAI).
   Grant the identity the "Cognitive Services OpenAI User" role on the backend resource.
-  Placeholder __TIMEOUT__ is replaced by infra/api.bicep.
+  The inbound extras (token limit, token metric, circuit breaker backend) and the forward block (with
+  retry) are inserted by infra/api.bicep where the double-underscore markers are.
 -->
 <policies>
   <inbound>
@@ -9,9 +10,10 @@
     <set-header name="api-key" exists-action="delete" />
     <set-header name="Authorization" exists-action="delete" />
     <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+    __INBOUND_EXTRAS__
   </inbound>
   <backend>
-    <forward-request timeout="__TIMEOUT__" buffer-response="false" fail-on-error-status-code="false" />
+    __FORWARD__
   </backend>
   <outbound />
   <on-error />
