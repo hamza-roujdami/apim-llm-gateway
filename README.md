@@ -2,7 +2,7 @@
 
 Bicep that provisions Azure API Management as an AI gateway for models from **Compass (Core42)** and **Microsoft Foundry**. Apps call one gateway with an OpenAI-compatible client; APIM adds the backend credentials and forwards the request without buffering, so streaming works.
 
-Status: templates lint and pass ARM validation. APIM has not been deployed or smoke-tested yet.
+Status: deployed and smoke-tested end to end on the `/foundry` API (`gpt-6-sol`, `text-embedding-3-large`; chat, Responses, embeddings, streaming, background and cancel all pass, also with the OpenAI Python SDK). The `/compass` API routes to Compass but has not been tested with a real Compass key yet.
 
 ## Architecture
 
@@ -69,7 +69,7 @@ client = AsyncOpenAI(
 response = await client.responses.create(model="gpt-6-sol", input="Say hi")
 ```
 
-Microsoft Agent Framework (Python): pass the same client to `OpenAIChatClient(model_id="gpt-6-sol", async_client=client)` for Responses, or to `OpenAIChatCompletionClient` for Chat Completions. Use the OpenAI clients, not the Azure OpenAI ones, which build Azure-style paths. Not yet tested through the gateway.
+Microsoft Agent Framework (Python): pass the same client to `OpenAIChatClient(model_id="gpt-6-sol", async_client=client)` for Responses, or to `OpenAIChatCompletionClient` for Chat Completions. Use the OpenAI clients, not the Azure OpenAI ones, which build Azure-style paths. The OpenAI SDK pattern above is tested through the gateway; the Agent Framework wrapper is not yet.
 
 ## Layout
 
