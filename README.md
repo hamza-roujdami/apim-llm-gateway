@@ -69,7 +69,20 @@ client = AsyncOpenAI(
 response = await client.responses.create(model="gpt-6-sol", input="Say hi")
 ```
 
-Microsoft Agent Framework (Python): pass the same client to `OpenAIChatClient(model_id="gpt-6-sol", async_client=client)` for Responses, or to `OpenAIChatCompletionClient` for Chat Completions. Use the OpenAI clients, not the Azure OpenAI ones, which build Azure-style paths. The OpenAI SDK pattern above is tested through the gateway; the Agent Framework wrapper is not yet.
+Microsoft Agent Framework (Python) takes the same settings directly. Use the OpenAI clients (`OpenAIChatClient` for Responses, `OpenAIChatCompletionClient` for Chat Completions), not the Azure OpenAI routing, which builds Azure-style paths:
+
+```python
+from agent_framework.openai import OpenAIChatClient
+
+client = OpenAIChatClient(
+    model="gpt-6-sol",
+    base_url="https://<apim>.azure-api.net/foundry/v1",   # or .../compass/v1
+    api_key="unused",
+    default_headers={"api-key": "<apim subscription key>"},
+)
+```
+
+A runnable agent with tools is in [`app/`](app/). It is tested through the gateway on `/foundry` (tool calls, streaming, multi-turn); `/compass` is untested until a key is available.
 
 ## Layout
 
@@ -83,7 +96,8 @@ infra/
   operations.json          the operations exposed on every API
   policies/                api-key.xml, managed-identity.xml
   params/                  main.example.bicepparam; main.local.bicepparam is git-ignored
-scripts/smoke-test.sh
+scripts/smoke-test.sh      checks every operation through the gateway
+app/                       example Microsoft Agent Framework agent (Python) that calls the gateway
 ```
 
 ## Deploy
