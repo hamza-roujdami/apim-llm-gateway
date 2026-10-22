@@ -6,17 +6,18 @@ from pydantic import ValidationError
 
 from gateway_agent.agent import build_agent
 from gateway_agent.config import Settings
+from gateway_agent.streaming import delta_text
 
 
 async def _ask(agent, prompt: str, session, stream: bool) -> None:
     if stream:
         started = False
         async for chunk in agent.run(prompt, session=session, stream=True):
-            if chunk.text:
+            if text := delta_text(chunk):
                 if not started:
                     print("Agent: ", end="", flush=True)
                     started = True
-                print(chunk.text, end="", flush=True)
+                print(text, end="", flush=True)
         if started:
             print()
     else:
