@@ -4,9 +4,10 @@ param accountName string
 param projectPrefix string
 param location string
 param tags object
+@description('Turn off API keys on the account so APIM (Entra identity) is the only way in.')
+param disableLocalAuth bool
 
-@description('Model deployment name; clients use it as the model name.')
-param modelDeploymentName string
+@description('Model name. The deployment is named after it, and clients send that name as "model".')
 param modelName string
 param modelVersion string
 @allowed(['GlobalStandard', 'DataZoneStandard', 'Standard'])
@@ -15,13 +16,6 @@ param modelSkuName string
 @minValue(1)
 param modelCapacity int
 
-@description('Also deploy an embeddings model.')
-param deployEmbeddingModel bool
-@description('Embeddings deployment name (same as the model name).')
-param embeddingModelName string
-@description('Thousands of tokens per minute.')
-@minValue(1)
-param embeddingCapacity int
 resource account 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
   name: accountName
   location: location
@@ -33,6 +27,7 @@ resource account 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
     customSubDomainName: accountName
     allowProjectManagement: true
     publicNetworkAccess: 'Enabled'
+    disableLocalAuth: disableLocalAuth
   }
 }
 
@@ -50,7 +45,7 @@ resource project 'Microsoft.CognitiveServices/accounts/projects@2025-06-01' = {
 // The account allows one write operation at a time, so deploy the model after the project.
 resource model 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = {
   parent: account
-  name: modelDeploymentName
+  name: modelName
   dependsOn: [project]
   sku: {
     name: modelSkuName
@@ -61,24 +56,6 @@ resource model 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = {
       format: 'OpenAI'
       name: modelName
       version: modelVersion
-    }
-  }
-}
-
-// One write at a time on the account: deploy after the chat model.
-resource embedding 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = if (deployEmbeddingModel) {
-  parent: account
-  name: embeddingModelName
-  dependsOn: [model]
-  sku: {
-    name: modelSkuName
-    capacity: embeddingCapacity
-  }
-  properties: {
-    model: {
-      format: 'OpenAI'
-      name: embeddingModelName
-      version: '1'
     }
   }
 }

@@ -1,0 +1,7 @@
+[
+  {"name": "responses-create", "displayName": "Create a response", "method": "POST", "urlTemplate": "/v1/responses", "templateParameters": []},
+  {"name": "responses-get", "displayName": "Get a response", "method": "GET", "urlTemplate": "/v1/responses/{response_id}", "templateParameters": ["response_id"]},
+  {"name": "responses-delete", "displayName": "Delete a response", "method": "DELETE", "urlTemplate": "/v1/responses/{response_id}", "templateParameters": ["response_id"]},
+  {"name": "responses-cancel", "displayName": "Cancel a background response", "method": "POST", "urlTemplate": "/v1/responses/{response_id}/cancel", "templateParameters": ["response_id"]},
+  {"name": "responses-input-items", "displayName": "List input items", "method": "GET", "urlTemplate": "/v1/responses/{response_id}/input_items", "templateParameters": ["response_id"]}
+]

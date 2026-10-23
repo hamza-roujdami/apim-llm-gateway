@@ -1,0 +1,27 @@
+<!-- Entra ID authentication (authMode = entra). Filled in by api.bicep: __TENANT_ID__, __CLIENT_ID__, __ROLE__. -->
+<!-- Accept only tokens issued by this tenant, for this gateway app, that carry the app role. The role claim is what an
+     identity team grants to a caller (managed identity or app registration). -->
+<validate-jwt header-name="Authorization" require-scheme="Bearer" require-signed-tokens="true" require-expiration-time="true"
+    failed-validation-httpcode="401" failed-validation-error-message="Unauthorized" output-token-variable-name="jwt">
+  <openid-config url="https://login.microsoftonline.com/__TENANT_ID__/v2.0/.well-known/openid-configuration" />
+  <audiences>
+    <audience>__CLIENT_ID__</audience>
+    <audience>api://__CLIENT_ID__</audience>
+  </audiences>
+  <issuers>
+    <issuer>https://login.microsoftonline.com/__TENANT_ID__/v2.0</issuer>
+  </issuers>
+  <required-claims>
+    <claim name="roles" match="any">
+      <value>__ROLE__</value>
+    </claim>
+  </required-claims>
+</validate-jwt>
+<!-- Who is calling: the client app id of the token (azp), used as the key for the token limit and the metric. -->
+<set-variable name="caller" value="@{
+    var jwt = (Jwt)context.Variables["jwt"];
+    string[] v;
+    if (jwt.Claims.TryGetValue("azp", out v) && v.Length > 0) { return v[0]; }
+    if (jwt.Claims.TryGetValue("appid", out v) && v.Length > 0) { return v[0]; }
+    return jwt.Subject;
+}" />

@@ -1,6 +1,6 @@
 targetScope = 'resourceGroup'
 
-metadata description = 'APIM as an AI gateway: a /compass API (api-key) and a /foundry API (managed identity), with an optional Foundry account + model and monitoring.'
+metadata description = 'APIM as an AI gateway for Microsoft Foundry: the Responses API for gpt-6-sol, with optional monitoring.'
 
 // ---------- APIM ----------
 @description('APIM instance name (globally unique, 1-50 chars).')
@@ -18,50 +18,35 @@ param skuName string = 'StandardV2'
 @minValue(1)
 param skuCapacity int = 1
 
-@description('Seconds to wait for backend response headers. Values above 240 may be cut by network idle timeouts on non-streaming calls; prefer stream or background.')
-@minValue(1)
-param forwardTimeoutSeconds int = 600
+// ---------- Caller authentication ----------
+@description('subscriptionKey: each app gets an APIM subscription key (simple, good for dev and sandbox). entra: callers send an Entra ID token with the gateway app role (recommended for production); needs entraClientId.')
+@allowed(['subscriptionKey', 'entra'])
+param authMode string = 'subscriptionKey'
 
-// ---------- Gateway protections (apply to both APIs) ----------
-@description('Create one APIM subscription per app on each API, named <api>-<app> (for example compass-team-a). Revoke an app by deleting its subscription.')
+@description('Key mode: create one APIM subscription per app, named foundry-<app> (for example foundry-team-a). Revoke an app by deleting its subscription. Ignored in entra mode.')
 param apps array = []
-@description('Token limit per minute for each subscription (app). 0 = no limit. Over the limit the caller gets 429 with Retry-After.')
+
+@description('Entra mode: client ID of the gateway app registration, which is the audience of the tokens. Create it with infra/entra-setup.sh.')
+param entraClientId string = ''
+@description('Entra mode: tenant that issues the tokens.')
+param entraTenantId string = tenant().tenantId
+@description('Entra mode: app role that a token must carry. Grant it to each caller with infra/entra-setup.sh.')
+param entraRequiredRole string = 'Gateway.Invoke'
+
+@description('Token limit per app per minute (per APIM subscription in key mode, per calling identity in entra mode). Keep it at or below the model capacity. 0 turns the limit off.')
 @minValue(0)
-param tokensPerMinute int = 0
-@description('Emit token usage metrics to Application Insights (needs deployMonitoring).')
-param emitTokenMetrics bool = true
-@description('Retries on a 429 or 503 from the backend. 0 = off.')
-@minValue(0)
-@maxValue(5)
-param retryCount int = 2
-@description('Open a circuit breaker after 5 backend 429/5xx errors in a minute, for one minute.')
-param enableCircuitBreaker bool = false
+param tokensPerMinute int = 10000
 
 // ---------- Monitoring ----------
 @description('Create Log Analytics + Application Insights and wire them to APIM.')
 param deployMonitoring bool = true
 
-// ---------- Compass ----------
-param deployCompassApi bool = true
-param compassBackendUrl string = 'https://api.core42.ai'
-@description('Models callers may use on /compass. Empty = any model.')
-param compassAllowedModels array = []
-@secure()
-@description('Compass API key. Ignored when compassKeyVaultName is set. Empty deploys a placeholder you replace later.')
-param compassApiKey string = ''
-@description('Existing Key Vault in this resource group (Azure RBAC authorization) that holds the Compass key. APIM gets "Key Vault Secrets User" on it.')
-param compassKeyVaultName string = ''
-param compassKeySecretName string = 'compass-api-key'
-
 // ---------- Foundry ----------
-param deployFoundryApi bool = true
-@description('Models callers may use on /foundry. Empty = any model.')
-param foundryAllowedModels array = []
-@description('Create a Foundry account, project and model deployment. Set false to use an existing account via foundryAccountName.')
+@description('Create a Foundry account, project and the model deployment. Set false to use an existing account via foundryAccountName; it must already have the model deployed under the name in modelName.')
 param deployFoundryAccount bool = true
 @description('Existing Foundry account in this resource group; used only when deployFoundryAccount is false.')
 param foundryAccountName string = ''
-param modelDeploymentName string = 'gpt-6-sol'
+@description('Model name. The deployment is named after it, and clients send that name as "model".')
 param modelName string = 'gpt-6-sol'
 param modelVersion string = '2026-09-22'
 @allowed(['GlobalStandard', 'DataZoneStandard', 'Standard'])
@@ -69,18 +54,13 @@ param modelSkuName string = 'DataZoneStandard'
 @description('Thousands of tokens per minute. DataZoneStandard needs at least 15.')
 @minValue(1)
 param modelCapacity int = 15
-
-@description('Also deploy an embeddings model so /foundry/v1/embeddings works.')
-param deployEmbeddingModel bool = true
-param embeddingModelName string = 'text-embedding-3-large'
-@description('Thousands of tokens per minute.')
-@minValue(1)
-param embeddingCapacity int = 20
+@description('Turn off API keys on the Foundry account, so APIM (Entra identity) is the only way in. Applies when the account is created here.')
+param disableFoundryLocalAuth bool = true
 
 var namePrefix = 'llmgw'
 var foundryName = deployFoundryAccount ? '${namePrefix}-foundry-${uniqueString(resourceGroup().id)}' : foundryAccountName
 
-module monitoring 'monitoring.bicep' = if (deployMonitoring) {
+module monitoring 'modules/monitoring.bicep' = if (deployMonitoring) {
   name: 'monitoring'
   params: {
     name: namePrefix
@@ -89,25 +69,22 @@ module monitoring 'monitoring.bicep' = if (deployMonitoring) {
   }
 }
 
-module foundry 'foundry.bicep' = if (deployFoundryAccount) {
+module foundry 'modules/foundry.bicep' = if (deployFoundryAccount) {
   name: 'foundry'
   params: {
     accountName: foundryName
     projectPrefix: namePrefix
     location: location
     tags: tags
-    modelDeploymentName: modelDeploymentName
     modelName: modelName
     modelVersion: modelVersion
     modelSkuName: modelSkuName
     modelCapacity: modelCapacity
-    deployEmbeddingModel: deployEmbeddingModel
-    embeddingModelName: embeddingModelName
-    embeddingCapacity: embeddingCapacity
+    disableLocalAuth: disableFoundryLocalAuth
   }
 }
 
-module apim 'apim.bicep' = {
+module apim 'modules/apim.bicep' = {
   name: 'apim'
   params: {
     name: apimName
@@ -118,84 +95,33 @@ module apim 'apim.bicep' = {
     skuName: skuName
     skuCapacity: skuCapacity
     logAnalyticsWorkspaceId: deployMonitoring ? monitoring!.outputs.logAnalyticsWorkspaceId : ''
-    appInsightsId: deployMonitoring ? monitoring!.outputs.appInsightsId : ''
+    appInsightsName: deployMonitoring ? monitoring!.outputs.appInsightsName : ''
   }
 }
 
-var useCompassKeyVault = deployCompassApi && !empty(compassKeyVaultName)
-
-resource compassVault 'Microsoft.KeyVault/vaults@2024-11-01' existing = if (useCompassKeyVault) {
-  name: compassKeyVaultName
-}
-
-// Key Vault Secrets User
-var keyVaultSecretsUserRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0e152a9fa2b4')
-
-resource compassVaultAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (useCompassKeyVault) {
-  name: guid(compassVault.id, apimName, keyVaultSecretsUserRoleId)
-  scope: compassVault
-  properties: {
-    principalId: apim.outputs.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: keyVaultSecretsUserRoleId
-  }
-}
-
-module compassKey 'compass-key.bicep' = if (deployCompassApi) {
-  name: 'compass-key'
-  dependsOn: [compassVaultAccess]
+module api 'modules/api.bicep' = {
+  name: 'api'
   params: {
     apimName: apim.outputs.name
-    apiKey: compassApiKey
-    keyVaultSecretUri: useCompassKeyVault ? '${compassVault!.properties.vaultUri}secrets/${compassKeySecretName}' : ''
-  }
-}
-
-module compassApi 'api.bicep' = if (deployCompassApi) {
-  name: 'api-compass'
-  dependsOn: [compassKey]
-  params: {
-    apimName: apim.outputs.name
-    name: 'compass'
-    displayName: 'Compass'
-    backendUrl: compassBackendUrl
-    authMode: 'apiKey'
-    forwardTimeoutSeconds: forwardTimeoutSeconds
-    apps: apps
-    tokensPerMinute: tokensPerMinute
-    emitTokenMetrics: emitTokenMetrics && deployMonitoring
-    retryCount: retryCount
-    enableCircuitBreaker: enableCircuitBreaker
-    allowedModels: compassAllowedModels
-  }
-}
-
-module foundryApi 'api.bicep' = if (deployFoundryApi) {
-  name: 'api-foundry'
-  params: {
-    apimName: apim.outputs.name
-    name: 'foundry'
-    displayName: 'Foundry'
     backendUrl: 'https://${foundryName}.openai.azure.com/openai'
-    authMode: 'managedIdentity'
-    forwardTimeoutSeconds: forwardTimeoutSeconds
+    authMode: authMode
     apps: apps
+    entraTenantId: entraTenantId
+    entraClientId: entraClientId
+    entraRequiredRole: entraRequiredRole
     tokensPerMinute: tokensPerMinute
-    emitTokenMetrics: emitTokenMetrics && deployMonitoring
-    retryCount: retryCount
-    enableCircuitBreaker: enableCircuitBreaker
-    allowedModels: foundryAllowedModels
+    emitTokenMetrics: deployMonitoring
   }
 }
 
-resource foundryAccount 'Microsoft.CognitiveServices/accounts@2025-06-01' existing = if (deployFoundryApi) {
+resource foundryAccount 'Microsoft.CognitiveServices/accounts@2025-06-01' existing = {
   name: foundryName
 }
 
 // Cognitive Services OpenAI User
 var openAiUserRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')
 
-resource foundryAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployFoundryApi) {
+resource foundryAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(foundryAccount.id, apimName, openAiUserRoleId)
   scope: foundryAccount
   dependsOn: [foundry]
@@ -208,7 +134,5 @@ resource foundryAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = if
 
 output gatewayUrl string = apim.outputs.gatewayUrl
 output foundryAccountName string = foundryName
-output compassSubscriptionName string = deployCompassApi ? compassApi!.outputs.subscriptionName : ''
-output foundrySubscriptionName string = deployFoundryApi ? foundryApi!.outputs.subscriptionName : ''
-output compassAppSubscriptionNames array = deployCompassApi ? compassApi!.outputs.appSubscriptionNames : []
-output foundryAppSubscriptionNames array = deployFoundryApi ? foundryApi!.outputs.appSubscriptionNames : []
+output subscriptionName string = api.outputs.subscriptionName
+output appSubscriptionNames array = api.outputs.appSubscriptionNames

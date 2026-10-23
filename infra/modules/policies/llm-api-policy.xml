@@ -1,0 +1,26 @@
+<!-- API policy for the Foundry Responses API. What each policy does, and its docs, is in the README. -->
+<policies>
+  <inbound>
+    <base />
+    <!-- Caller authentication: validate-jwt in Entra mode, nothing here in key mode (APIM checks the subscription key) -->
+    __CALLER_AUTH__
+    <!-- Foundry auth with APIM's managed identity (no keys) -->
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+    <!-- Per-app token limit -->
+    __TOKEN_LIMIT__
+    <!-- Per-app token usage metric -->
+    __TOKEN_METRIC__
+  </inbound>
+  <backend>
+    <!-- Retry throttling (429) and short outages (503); stream responses without buffering -->
+    <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode == 503)" count="2" interval="1" first-fast-retry="true">
+      <forward-request timeout="240" buffer-request-body="true" buffer-response="false" />
+    </retry>
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

@@ -1,30 +1,60 @@
 # APIM LLM Gateway
 
-Bicep that provisions Azure API Management as an AI gateway for models from **Compass (Core42)** and **Microsoft Foundry**. Apps call one gateway with an OpenAI-compatible client; APIM adds the backend credentials and forwards the request without buffering, so streaming works. It includes an example Microsoft Agent Framework agent to try the whole cycle.
+Bicep that provisions Azure API Management as an AI gateway in front of **Microsoft Foundry**, serving **`gpt-6-sol`** on the Responses API. Apps call one gateway with an OpenAI-compatible client. Callers authenticate with an APIM subscription key (simple, for dev and sandbox) or an Entra ID token checked with `validate-jwt` (for production). APIM authenticates to Foundry with its managed identity (no Foundry keys), and the policy adds per-app token limits, token metrics, a short retry and unbuffered streaming. It includes an example Microsoft Agent Framework agent to try the whole cycle.
 
-Status: deployed and tested end to end on the `/foundry` API (`gpt-6-sol`, `text-embedding-3-large`): chat, Responses, embeddings, streaming, background, cancel, and the example agent with tools. Per-app subscriptions, token limits and metrics, retry, the circuit breaker and the model allow-list are also tested live on `/foundry`. The `/compass` API routes to Compass but has not been tested with a real Compass key yet, and the Key Vault option for the Compass key validates but has not been run against a vault (see [Known limits](#known-limits)).
+Status: deployed from this repo and tested on Azure with `infra/test.sh` in both modes (21 checks in key mode, 25 in Entra mode: infra, policies and all Responses operations on `gpt-6-sol`, including unbuffered streaming and background mode). Also shown live: the per-app token limit returns `429` with `Retry-After` in both modes, token usage appears in Application Insights per subscription or per calling identity, and the example agent works with a key and with an Entra token. Not yet shown: the retry on a backend `429`/`503`, because that needs Foundry to throttle.
+
+## Scenario: Rapid innovation (Dev and Sandbox)
+
+This repo is the building block for a shared **AI hub** that lets developers start prototyping with a model without each project creating its own Foundry account. The hub owns the gateway and the model. Projects only get a gateway URL and their own key.
+
+```mermaid
+flowchart LR
+    subgraph sandbox["Sandbox subscription: one resource group per project"]
+        px["rg-project-a<br/>prototype, team group, budget, expiry tag"]
+        py["rg-project-b<br/>prototype, team group, budget, expiry tag"]
+    end
+
+    subgraph hub["AI hub subscription (this repo)"]
+        apim["APIM gateway<br/>foundry-project-a, foundry-project-b<br/>low token limit per project"]
+        foundry["Foundry account<br/>gpt-6-sol"]
+        mon["Log Analytics +<br/>Application Insights"]
+    end
+
+    px -->|"project-a key"| apim
+    py -->|"project-b key"| apim
+    apim -->|"managed identity"| foundry
+    apim -.->|"usage per project"| mon
+```
+
+How the pieces map to this scenario:
+
+| Need | How |
+|---|---|
+| Start prototyping fast | One deployment of this repo (about 5 minutes) and a gateway URL. No Foundry account or quota request per project. |
+| Separate projects | One APIM subscription per project via `apps`. Each project has its own key, token limit and usage numbers, and you revoke a project by deleting its subscription. |
+| Protect the shared quota | `tokensPerMinute` is a per-project limit. Keep the sum of limits in line with the model capacity (`modelCapacity`). |
+| See who uses what | The token metric by subscription in Application Insights (queries below). |
+| Keep prototypes cheap | Low limits, public endpoints, and the smallest model capacity. Delete the resource group when the exercise ends. |
+
+Start from [`infra/params/sandbox.example.bicepparam`](infra/params/sandbox.example.bicepparam). To onboard a project, add its name to `apps`, redeploy, and hand the project its key.
+
+Not in this repo, to be set up around it in the subscriptions: one resource group per project with an Entra group, budget and expiry tag; Azure Policy in the sandbox (required tags, allowed regions, and a deny rule for creating Foundry or Azure OpenAI accounts so projects cannot bypass the gateway); and a pipeline that deploys the params file from a pull request. When a prototype proves itself, it moves to a regular dev subscription and a prod gateway, which can use Entra token authentication (`authMode = 'entra'`, see [Authentication](#authentication-keys-or-entra-tokens)). Private networking is not included yet.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    app["Apps and agents<br/>OpenAI-compatible client<br/>APIM subscription key"]
+    app["Apps and agents<br/>OpenAI-compatible client<br/>APIM key or Entra token"]
 
     subgraph azure["Azure subscription (this repo)"]
-        subgraph apim["APIM Standard v2, public"]
-            compassApi["/compass API<br/>api-key policy"]
-            foundryApi["/foundry API<br/>managed identity policy"]
-        end
+        apim["APIM Standard v2, public<br/>/foundry API<br/>caller auth, token limit, retry"]
         monitoring["Log Analytics +<br/>Application Insights"]
-        foundry["Foundry account<br/>model deployments"]
+        foundry["Foundry account<br/>gpt-6-sol"]
     end
 
-    compass["Compass (Core42)<br/>api.core42.ai"]
-
-    app -->|"/compass/v1/..."| compassApi
-    app -->|"/foundry/v1/..."| foundryApi
-    compassApi -->|"api-key header"| compass
-    foundryApi -->|"Entra token"| foundry
+    app -->|"/foundry/v1/..."| apim
+    apim -->|"managed identity"| foundry
     apim -.->|"logs, no bodies"| monitoring
 ```
 
@@ -32,30 +62,62 @@ flowchart LR
 
 | Resource | File | Notes |
 |---|---|---|
-| APIM (Standard v2, public) | `apim.bicep` | System identity, logging, Application Insights custom metrics |
-| `compass-api-key` secret (named value) | `compass-key.bicep` | From a parameter, a placeholder, or an existing Key Vault |
-| `/compass` and `/foundry` APIs | `api.bicep` | 7 operations, a policy and a default subscription each, plus the optional protections below |
-| Foundry account, project, chat model (`gpt-6-sol`), embeddings model (`text-embedding-3-large`) | `foundry.bicep` | Optional; or use an existing account |
-| Log Analytics, Application Insights | `monitoring.bicep` | Optional |
-| Role for APIM on Foundry (and on the Key Vault, if used) | `main.bicep` | *Cognitive Services OpenAI User* / *Key Vault Secrets User* |
+| APIM (Standard v2 by default, public) | `modules/apim.bicep` | System identity, logging to Log Analytics and Application Insights |
+| `/foundry` API | `modules/api.bicep` | 5 operations (the Responses API) and the policy. Key mode: a default subscription and optional per-app subscriptions. Entra mode: no subscriptions |
+| Foundry account, project, `gpt-6-sol` deployment | `modules/foundry.bicep` | Optional; or use an existing account. API keys on the account are turned off (`disableFoundryLocalAuth`), so APIM is the only way in |
+| Log Analytics, Application Insights | `modules/monitoring.bicep` | Optional |
+| Role for APIM on Foundry | `main.bicep` | *Cognitive Services OpenAI User* |
+| Gateway app registration (Entra mode) | `entra-setup.sh` | Not Bicep: created once with the script, its client id is the `entraClientId` parameter |
 
-Both APIs expose the same OpenAI v1-style operations: `POST /v1/chat/completions`, `POST /v1/embeddings`, and the Responses API (`POST /v1/responses`, `GET`/`DELETE /v1/responses/{id}`, `POST .../cancel`, `GET .../input_items`).
+### Operations
 
-### Gateway protections (all optional parameters)
+| Operation | Path |
+|---|---|
+| Create a response | `POST /v1/responses` |
+| Get a response | `GET /v1/responses/{id}` |
+| Delete a response | `DELETE /v1/responses/{id}` |
+| Cancel a background response | `POST /v1/responses/{id}/cancel` |
+| List input items | `GET /v1/responses/{id}/input_items` |
 
-They apply to both APIs, so the same controls guard Compass and Foundry.
+Only the Responses API is exposed. Chat Completions, Embeddings and the Azure-style `/openai/deployments/...` paths are not. Use an OpenAI-compatible client with the gateway as `base_url`.
 
-| Parameter | Default | What it does |
+### The policy
+
+[`infra/modules/policies/llm-api-policy.xml`](infra/modules/policies/llm-api-policy.xml) is the one API policy:
+
+| Element | What it does | Docs |
 |---|---|---|
-| `apps` | `[]` | One APIM subscription per app and API, named `<api>-<app>` (for example `foundry-team-a`). Each app gets its own key, token counter and metrics. Delete a subscription to revoke that app. |
-| `tokensPerMinute` | `0` (off) | Token limit per app (`llm-token-limit`). Over the limit the caller gets `429` with `Retry-After`. |
-| `emitTokenMetrics` | `true` | Token usage per API, app and token type, as the custom metric `azure.ai_gateway.client.token.usage` in Application Insights (`llm-emit-token-metric`; needs `deployMonitoring`). |
-| `retryCount` | `2` | Retries a backend `429` (and `503` when the circuit breaker is off) with waits of 1 s then 3 s. A stream that already started is not retried. `0` turns it off. |
-| `enableCircuitBreaker` | `false` | Backend circuit breaker: after 5 backend `429`/`5xx` responses in a minute, callers get `503` with `Retry-After` for a minute, without calling the backend. |
-| `compassAllowedModels`, `foundryAllowedModels` | `[]` (any) | Only these `model` values are accepted on chat, embeddings and Responses requests. Anything else, or a missing model, gets a `400` with code `model_not_allowed`. |
-| `compassKeyVaultName`, `compassKeySecretName` | empty, `compass-api-key` | Read the Compass key from an existing Key Vault instead of a parameter. APIM's identity gets *Key Vault Secrets User* on it. |
+| `validate-jwt` (Entra mode only) | Accepts only tokens from your tenant, for the gateway app, that carry the `Gateway.Invoke` app role; anything else gets `401`. The caller is the token's client app id. | [docs](https://learn.microsoft.com/azure/api-management/validate-jwt-policy) |
+| `authentication-managed-identity` | APIM's identity gets a token and sends it to Foundry, so no Foundry key is stored anywhere. Required. | [docs](https://learn.microsoft.com/azure/api-management/authentication-managed-identity-policy) |
+| `llm-token-limit` | Limits tokens per minute per app: per APIM subscription in key mode, per calling identity in Entra mode. Over the limit the caller gets `429` with `Retry-After`. Set with `tokensPerMinute` (default `10000`, `0` turns it off). | [docs](https://learn.microsoft.com/azure/api-management/llm-token-limit-policy) |
+| `llm-emit-token-metric` | Sends token usage per app (subscription id or `Caller`) to Application Insights as a custom metric. On when `deployMonitoring` is true. | [docs](https://learn.microsoft.com/azure/api-management/llm-emit-token-metric-policy) |
+| `retry` | Retries a backend `429` or `503` twice. A stream that has already started is not retried. | [docs](https://learn.microsoft.com/azure/api-management/retry-policy) |
+| `forward-request` | `buffer-response="false"` so streamed tokens reach the client immediately; 240 s timeout. | [docs](https://learn.microsoft.com/azure/api-management/forward-request-policy) |
 
-Not included: private networking, caching, content filtering, Azure-style `/openai/deployments/...` paths, and the Compass Sweden Responses paths (`/v1/sweden/responses`, used only by the newest GPT-5.x models). Add what you need for production.
+Not included: a backend pool or circuit breaker, a model allow-list, private networking, caching, content filtering. Add what you need for production.
+
+### Authentication: keys or Entra tokens
+
+`authMode` picks how callers prove who they are. Both modes use the same policy, limits and metrics; only the caller check and the per-app identity differ.
+
+| | `subscriptionKey` (default) | `entra` |
+|---|---|---|
+| Caller sends | `api-key: <APIM subscription key>` | `Authorization: Bearer <Entra access token>` |
+| One identity per app | `apps = ['team-a', ...]` creates `foundry-<app>` | an app role granted to the app's managed identity or app registration |
+| Revoke an app | delete its subscription | remove its app role assignment |
+| Secret to protect | the key (shared secret, must be rotated) | none for managed identities; a client secret only outside Azure |
+| Token limit and metric counted per | subscription | calling identity (client app id) |
+| Good for | dev, sandbox, quick start | production, services in Azure |
+
+Entra mode setup, once per hub:
+
+```bash
+./infra/entra-setup.sh gateway                       # creates the gateway app registration, prints entraClientId
+# set authMode = 'entra' and entraClientId in your params file (see infra/params/entra.example.bicepparam), then deploy
+./infra/entra-setup.sh grant <entraClientId> <managed identity object id>     # for each calling app
+```
+
+The script creates an app registration with v2 tokens and one app role, `Gateway.Invoke`, and requires an assignment, so an app without the role cannot even get a token. The role is a workload permission: it goes to managed identities and app registrations. It does not apply to a person signed in with `az login`, whose token has no app role; for people, use key mode or give them a service principal. For callers outside Azure, `./infra/entra-setup.sh caller <entraClientId> <name> --secret` creates an app registration with a 30-day client secret.
 
 ## Quick start
 
@@ -64,7 +126,7 @@ Not included: private networking, caching, content filtering, Azure-style `/open
 - An Azure subscription where you can create resources **and role assignments** (Owner, or Contributor plus User Access Administrator).
 - [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (it installs Bicep on first use), `bash`, `curl` and `jq`.
 - [uv](https://docs.astral.sh/uv/) and Python 3.13, for the example agent.
-- Quota for `gpt-6-sol` and `text-embedding-3-large` in your region (check with `az cognitiveservices usage list -l <region>`). The defaults use the `DataZoneStandard` SKU; change `modelSkuName` in the params if your quota is elsewhere.
+- Quota for `gpt-6-sol` in your region (check with `az cognitiveservices usage list -l <region>`). The defaults use the `DataZoneStandard` SKU; change `modelSkuName` in the params if your quota is elsewhere.
 
 ### 1. Clone and sign in
 
@@ -78,10 +140,10 @@ az account set --subscription <subscription-id>
 ### 2. Configure
 
 ```bash
-cp infra/params/main.example.bicepparam infra/params/main.local.bicepparam
+cp infra/params/main.example.bicepparam infra/params/main.local.bicepparam   # or sandbox.example (project keys) or entra.example (Entra tokens)
 ```
 
-Edit `main.local.bicepparam` (it is git-ignored): set `apimName` (globally unique), `publisherEmail`, and review the model settings. To reuse an existing Foundry account instead of creating one, set `deployFoundryAccount=false` and `foundryAccountName`. To skip a backend, set `deployCompassApi` or `deployFoundryApi` to `false`.
+Edit `main.local.bicepparam` (it is git-ignored): set `apimName` (globally unique) and `publisherEmail`, and review the model settings. To reuse an existing Foundry account instead of creating one, set `deployFoundryAccount=false` and `foundryAccountName`; the account must already have `gpt-6-sol` deployed under that name.
 
 ### 3. Deploy
 
@@ -91,15 +153,15 @@ az group create -n $RG -l <region>      # a region where gpt-6-sol is available
 az deployment group create -g $RG -n main -f infra/main.bicep -p infra/params/main.local.bicepparam
 ```
 
-This takes about 10 minutes and bills while it runs (see [Clean up](#8-clean-up)). Note the gateway URL:
+This takes about 5 to 10 minutes and bills while it runs (see [Clean up](#7-clean-up)). Note the gateway URL:
 
 ```bash
 az deployment group show -g $RG -n main --query properties.outputs.gatewayUrl.value -o tsv
 ```
 
-### 4. Get the gateway keys
+### 4. Get credentials for a caller
 
-Each API has its own APIM subscription key. Clients send it in the `api-key` header.
+**Key mode.** Clients send the APIM subscription key in the `api-key` header.
 
 ```bash
 SUB=$(az account show --query id -o tsv)
@@ -108,49 +170,40 @@ FOUNDRY_KEY=$(az rest --method post --query primaryKey -o tsv \
   --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.ApiManagement/service/$APIM/subscriptions/foundry-default/listSecrets?api-version=2024-05-01")
 ```
 
-Use `compass-default` instead of `foundry-default` for the Compass key. If you set `apps`, each app has its own subscription (for example `foundry-team-a`); fetch its key the same way and give it to that app only.
+If you set `apps`, each app has its own subscription (for example `foundry-team-a`); fetch its key the same way and give it to that app only.
 
-### 5. Smoke test the gateway
+**Entra mode.** Grant the app role to the caller (see [Authentication](#authentication-keys-or-entra-tokens)). The caller then asks Entra for a token with the scope `api://<entraClientId>/.default`; with a managed identity or `DefaultAzureCredential` the Azure SDKs do this for you.
+
+### 5. Test the deployment
 
 ```bash
-GATEWAY_URL=https://$APIM.azure-api.net/foundry SUBSCRIPTION_KEY=$FOUNDRY_KEY \
-MODEL=gpt-6-sol EMBEDDING_MODEL=text-embedding-3-large ./scripts/smoke-test.sh
+./infra/test.sh $RG
 ```
 
-It checks chat, Responses, embeddings, streaming, background mode and cancel, and ends with `passed=10 failed=0`.
+The script reads the deployment to learn the auth mode, finds the APIM instance in the resource group, and runs three groups of checks. Infra: the APIM tier matches what you asked for, the API and its 5 operations exist, the policy has the expected elements, the APIM identity has its role on Foundry, and API keys on Foundry are off. Policies: calls without credentials, with a wrong key, a garbage token or a token for another audience get `401`, the token-limit header is returned, and streaming arrives unbuffered. Operations: create, stream, get, input items, delete, background mode and cancel. It ends with a summary such as `passed=21 failed=0 skipped=0`; checks for optional policies that you turned off are skipped. It needs `az`, `curl` and `jq`. `MODEL` defaults to `gpt-6-sol`.
+
+In key mode it fetches the `foundry-default` key itself. In Entra mode it needs a caller that holds the role: set `CALLER_CLIENT_ID` and `CALLER_CLIENT_SECRET` (see `entra-setup.sh caller ... --secret`), or `CALLER_TOKEN`.
+
+To test only the gateway, without `az`: `SKIP_INFRA=1 GATEWAY_URL=https://<apim>.azure-api.net/foundry SUBSCRIPTION_KEY=<key> ./infra/test.sh` (for Entra mode add `AUTH_MODE=entra ENTRA_TENANT_ID=... ENTRA_CLIENT_ID=...` and the caller variables).
 
 ### 6. Run the example agent
 
-`app/` is a Microsoft Agent Framework agent with two demo tools (time and weather) that calls a model through the gateway.
+`app/` is a Microsoft Agent Framework agent with two demo tools (time and weather) that calls `gpt-6-sol` through the gateway on the Responses API.
 
 ```bash
 cd app
-cp .env.example .env     # set GATEWAY_BASE_URL=https://<apim>.azure-api.net/foundry/v1 and GATEWAY_API_KEY=$FOUNDRY_KEY
+cp .env.example .env     # set GATEWAY_BASE_URL=https://<apim>.azure-api.net/foundry/v1 and GATEWAY_API_KEY=$FOUNDRY_KEY (key mode)
 uv sync
 uv run pytest            # offline tests
 uv run gateway-agent "What's the weather in Dubai?"    # ask once, streamed
 uv run gateway-agent                                   # interactive chat with memory
 ```
 
-`--no-stream` waits for the full answer. The agent code is in `app/src/gateway_agent/`; `agent.py` shows how it connects: an `OpenAIChatClient` whose `base_url` is the gateway and whose `default_headers` carry the subscription key.
+For an Entra-mode gateway, install the extra and set `GATEWAY_AUTH=entra` and `GATEWAY_ENTRA_SCOPE=api://<entraClientId>/.default` in `.env`: `uv sync --extra entra`. The agent then uses `DefaultAzureCredential` (a managed identity in Azure, or `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` elsewhere).
 
-### 7. Use Compass
+`--no-stream` waits for the full answer. The agent code is in `app/src/gateway_agent/`; `agent.py` shows how it connects: an `OpenAIChatClient` (the Responses client) whose `base_url` is the gateway and whose `default_headers` carry the subscription key (key mode) or whose `api_key` is an Entra token provider (Entra mode).
 
-Compass needs your Compass API key. Two ways to provide it:
-
-**Key Vault (recommended).** Create a Key Vault that uses Azure RBAC, store the key as the secret `compass-api-key`, and deploy with `compassKeyVaultName=<vault>` (and `compassKeySecretName` if you named it differently). APIM reads the secret with its managed identity, so the key never appears in parameters or deployment history. APIM must be able to reach the vault: public network access with "Allow trusted Microsoft services", or a private endpoint plus APIM VNet integration. If the first deployment fails reading the secret because the new role isn't active yet, run it again.
-
-**Directly.** Set the key without redeploying:
-
-```bash
-az apim nv update -g $RG -n $APIM --named-value-id compass-api-key --value "<compass key>" --secret true
-```
-
-If you redeploy later without Key Vault, pass `compassApiKey` again (a secure parameter, or `--parameters compassApiKey=...`). An empty value resets the named value to the placeholder `set-me-later`, and Compass answers 401.
-
-Then repeat steps 4 to 6 with the `compass-default` key and `/compass` instead of `/foundry`. Set `MODEL` to a Compass model served from the UAE region (for example `gpt-6-sol`, which Compass confirmed works on `/v1/responses`) and `EMBEDDING_MODEL=text-embedding-3-large`. Use `compassAllowedModels` to restrict callers to those models.
-
-### 8. Clean up
+### 7. Clean up
 
 Standard v2 is billed per hour. Delete everything when you are done:
 
@@ -169,34 +222,38 @@ ApiManagementGatewayLogs
 | order by calls desc
 ```
 
-In Application Insights use **Live Metrics**, **Failures** and **Performance**. Token usage per app is in the custom metric `azure.ai_gateway.client.token.usage`; in the Application Insights **Logs**:
+In Application Insights use **Live Metrics**, **Failures** and **Performance**. Token usage per app is the custom metric `azure.ai_gateway.client.token.usage`; in the Application Insights **Logs**:
 
 ```kusto
 customMetrics
 | where timestamp > ago(1d) and name == "azure.ai_gateway.client.token.usage"
-| extend app = tostring(customDimensions["Subscription ID"]), type = tostring(customDimensions["gen_ai.token.type"])
-| where type in ("input_tokens", "output_tokens")
+| extend app = coalesce(tostring(customDimensions["Caller"]), tostring(customDimensions["Subscription ID"])), type = tostring(customDimensions["gen_ai.token.type"])
+| where type in ("input_tokens", "output_tokens") and app != ""
 | summarize tokens = sum(valueSum) by app, type
 ```
 
-Rejected and throttled calls show in the gateway log: token-limit blocks as `OpenAITokenLimitExceeded` (429), an open circuit breaker as 503.
+`app` is the subscription id in key mode and the caller's client app id in Entra mode.
+
+Calls blocked by the token limit show in the gateway log as `OpenAITokenLimitExceeded` (429).
 
 ## Use from your own client
 
-The gateway reads the APIM subscription key from the **`api-key` header**. OpenAI-style clients send `Authorization: Bearer` by default, so add the header explicitly; the gateway drops `Authorization` before calling the backend, so the SDK's own key can be a dummy.
+### Key mode
+
+The gateway reads the APIM subscription key from the **`api-key` header**. OpenAI-style clients send `Authorization: Bearer` by default, so add the header explicitly. The policy replaces the `Authorization` header with APIM's own token, so the SDK's key can be a dummy.
 
 ```python
 from openai import AsyncOpenAI
 
 client = AsyncOpenAI(
-    base_url="https://<apim>.azure-api.net/foundry/v1",   # or .../compass/v1
+    base_url="https://<apim>.azure-api.net/foundry/v1",
     api_key="unused",
     default_headers={"api-key": "<apim subscription key>"},
 )
 response = await client.responses.create(model="gpt-6-sol", input="Say hi")
 ```
 
-Microsoft Agent Framework (Python) takes the same settings. Use the OpenAI clients (`OpenAIChatClient` for Responses, `OpenAIChatCompletionClient` for Chat Completions), not the Azure OpenAI routing, which builds Azure-style paths:
+Microsoft Agent Framework (Python) takes the same settings. Use `OpenAIChatClient`, which is the Responses client, and not the Azure OpenAI routing, which builds Azure-style paths:
 
 ```python
 from agent_framework.openai import OpenAIChatClient
@@ -209,32 +266,49 @@ client = OpenAIChatClient(
 )
 ```
 
+### Entra mode
+
+Install `azure-identity` and `aiohttp`. The token provider fetches and refreshes the token; the OpenAI SDK and the Agent Framework client both accept it as `api_key`.
+
+```python
+from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+from openai import AsyncOpenAI
+
+token_provider = get_bearer_token_provider(DefaultAzureCredential(), "api://<entraClientId>/.default")
+client = AsyncOpenAI(base_url="https://<apim>.azure-api.net/foundry/v1", api_key=token_provider)
+response = await client.responses.create(model="gpt-6-sol", input="Say hi")
+```
+
+With the Agent Framework, pass the same provider: `OpenAIChatClient(model="gpt-6-sol", base_url="https://<apim>.azure-api.net/foundry/v1", api_key=token_provider)`.
+
 ## Layout
 
 ```
 infra/
-  main.bicep               entry point
-  apim.bicep               APIM instance and logging
-  compass-key.bicep        the compass-api-key secret (parameter, placeholder or Key Vault)
-  api.bicep                one API (used for each backend): operations, policies, subscriptions
-  foundry.bicep            Foundry account + models (optional)
-  monitoring.bicep         Log Analytics + App Insights (optional)
-  operations.json          the operations exposed on every API
-  policies/                api-key.xml, managed-identity.xml, model-allowlist.xml
-  params/                  main.example.bicepparam; *.local.bicepparam is git-ignored
-scripts/smoke-test.sh      checks every operation through the gateway
-app/                       example Microsoft Agent Framework agent (Python)
+  main.bicep                       entry point
+  modules/
+    apim.bicep                     APIM instance and logging
+    api.bicep                      the /foundry API: operations, policy, subscriptions
+    foundry.bicep                  Foundry account + the gpt-6-sol deployment (optional)
+    monitoring.bicep               Log Analytics + App Insights (optional)
+    responses-operations.json      the operations exposed on the API
+    policies/llm-api-policy.xml    the API policy
+    policies/entra-auth.xml        validate-jwt block, used in Entra mode
+  params/                          main, sandbox and entra examples; *.local.bicepparam is git-ignored
+  entra-setup.sh                   creates the gateway app registration and grants callers (Entra mode)
+  test.sh                          tests the deployed infra, policies and operations
+app/                             example Microsoft Agent Framework agent (Python)
 ```
 
 ## Known limits
 
-- APIM `timeout` above 240 s may not be honored; for 4-7 minute generations use `stream: true` or Responses `background: true`. Background mode is untested on Compass.
-- Which region serves `gpt-6-sol` on Compass is unconfirmed (data residency).
-- A private Compass endpoint needs APIM to resolve its hostname to the private IP; confirm the hostname with Compass.
-- APIM Standard v2 has no static outbound IP, which matters if Compass restricts callers by IP.
+- APIM `timeout` above 240 s may not be honored; for 4-7 minute generations use `stream: true` or Responses `background: true`.
 - Token limits and metrics read the `usage` section of responses; for streamed requests the counts are estimated, and v2 tiers use an approximate token bucket, so a burst can briefly exceed the limit.
-- Retries use fixed waits (1 s, then 3 s) and do not follow a backend `Retry-After`; the circuit breaker does. With the breaker on, only `429` is retried so an open breaker answers immediately.
-- The model allow-list compares the `model` field to the names you list; it does not check that the backend serves them.
-- Compass's rate-limit behaviour is unknown, so `tokensPerMinute`, `retryCount` and the breaker thresholds (5 errors per minute, one-minute trip) are starting points, tested only against Foundry.
-- The Key Vault option validates (lint and ARM) but was not run against a vault: in the tenant used to build this repo, new Key Vaults are created with public network access forced off, so APIM could not be tested reading from one.
+- Retries wait 1 s between attempts (the first retry is immediate) and do not follow a backend `Retry-After`.
+- In key mode the client's `api-key` header (the APIM subscription key) is forwarded to Foundry next to APIM's token. Foundry ignores it (tested, including with API keys on the account turned off); add `<set-header name="api-key" exists-action="delete" />` to `<inbound>` if you want it stripped.
+- In key mode the built-in `master` subscription key opens every API in the instance. Keep it out of apps, and regenerate it.
+- Entra mode checks an app role, so it is for workload identities. A person signed in with `az login` is not accepted (no app role in the token).
+- An APIM v2 tier cannot be changed in place: redeploying with another `skuName` fails and leaves the instance as it was. Create a new instance to change the tier. `infra/test.sh` reports a mismatch between the requested and the live tier.
+- Tenants may cap client secret lifetimes; `entra-setup.sh` creates 30-day secrets and managed identities need none.
+- The Foundry account is created with public network access enabled, and APIM is public. Private networking is not included.
 - The example agent is tested with `agent-framework-openai` 1.17.0 and `agent-framework-core` 1.22.0 (the versions a fresh `uv sync` resolves). `app/uv.lock` is not committed.

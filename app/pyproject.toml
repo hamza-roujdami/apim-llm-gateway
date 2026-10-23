@@ -8,6 +8,13 @@ dependencies = [
     "pydantic-settings>=2.6,<3",
 ]
 
+[project.optional-dependencies]
+# For GATEWAY_AUTH=entra: token provider for managed identities and app registrations.
+entra = [
+    "azure-identity>=1.19",
+    "aiohttp>=3.9",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",

@@ -8,7 +8,8 @@ param publisherName string
 param skuName string
 param skuCapacity int
 param logAnalyticsWorkspaceId string
-param appInsightsId string
+@description('Application Insights component in the same resource group. Empty skips the logger and diagnostic.')
+param appInsightsName string
 
 resource apim 'Microsoft.ApiManagement/service@2024-05-01' = {
   name: name
@@ -44,24 +45,23 @@ resource logAnalytics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview'
   }
 }
 
-resource appInsights 'Microsoft.Insights/components@2020-02-02' existing = if (!empty(appInsightsId)) {
-  name: last(split(appInsightsId, '/'))
-  scope: resourceGroup(split(appInsightsId, '/')[2], split(appInsightsId, '/')[4])
+resource appInsights 'Microsoft.Insights/components@2020-02-02' existing = if (!empty(appInsightsName)) {
+  name: appInsightsName
 }
 
-resource logger 'Microsoft.ApiManagement/service/loggers@2024-05-01' = if (!empty(appInsightsId)) {
+resource logger 'Microsoft.ApiManagement/service/loggers@2024-05-01' = if (!empty(appInsightsName)) {
   parent: apim
   name: 'appinsights'
   properties: {
     loggerType: 'applicationInsights'
-    resourceId: appInsightsId
+    resourceId: appInsights.id
     credentials: {
       instrumentationKey: appInsights!.properties.InstrumentationKey
     }
   }
 }
 
-resource diagnostic 'Microsoft.ApiManagement/service/diagnostics@2024-05-01' = if (!empty(appInsightsId)) {
+resource diagnostic 'Microsoft.ApiManagement/service/diagnostics@2024-05-01' = if (!empty(appInsightsName)) {
   parent: apim
   name: 'applicationinsights'
   properties: {
